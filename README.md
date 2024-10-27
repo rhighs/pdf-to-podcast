@@ -16,7 +16,7 @@ To set up the project, follow these steps:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/knowsuchagency/pdf-to-podcast.git
+   git clone https://github.com/rhighs/pdf-to-podcast.git
    cd pdf-to-podcast
    ```
 

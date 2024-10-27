@@ -23,21 +23,12 @@ if sentry_dsn := os.getenv("SENTRY_DSN"):
     sentry_sdk.init(sentry_dsn)
 
 app = FastAPI()
-
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class DialogueItem(BaseModel):
     text: str
-    speaker: Literal["female-1", "male-1", "female-2"]
-
-    @property
-    def voice(self):
-        return {
-            "female-1": "alloy",
-            "male-1": "onyx",
-            "female-2": "shimmer",
-        }[self.speaker]
+    speaker: Literal["guest", "presenter"]
 
 
 class Dialogue(BaseModel):
@@ -45,13 +36,10 @@ class Dialogue(BaseModel):
     dialogue: List[DialogueItem]
 
 
-def get_mp3(text: str, voice: str, api_key: str = None) -> bytes:
-    client = OpenAI(
-        api_key=api_key or os.getenv("OPENAI_API_KEY"),
-    )
-
+def get_mp3(text: str, tts_model, voice: str, api_key: str = None) -> bytes:
+    client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
     with client.audio.speech.with_streaming_response.create(
-        model="tts-1",
+        model=tts_model,
         voice=voice,
         input=text,
     ) as response:
@@ -61,7 +49,14 @@ def get_mp3(text: str, voice: str, api_key: str = None) -> bytes:
             return file.getvalue()
 
 
-def generate_audio(file: str, openai_api_key: str = None) -> bytes:
+def generate_audio(
+    file: str,
+    model_choice: str,
+    tts_version: str,
+    guest_voice: str,
+    presenter_voice: str,
+    openai_api_key: str = None,
+) -> bytes:
 
     if not os.getenv("OPENAI_API_KEY", openai_api_key):
         raise gr.Error("OpenAI API key is required")
@@ -72,7 +67,7 @@ def generate_audio(file: str, openai_api_key: str = None) -> bytes:
 
     @retry(retry=retry_if_exception_type(ValidationError))
     @llm(
-        model="gpt-4o-mini",
+        model=model_choice,
     )
     def generate_dialogue(text: str) -> Dialogue:
         """
@@ -104,6 +99,8 @@ def generate_audio(file: str, openai_api_key: str = None) -> bytes:
         Make the dialogue as long and detailed as possible, while still staying on topic and maintaining an engaging flow. Aim to use your full output capacity to create the longest podcast episode you can, while still communicating the key information from the input text in an entertaining way.
 
         At the end of the dialogue, have the host and guest speakers naturally summarize the main insights and takeaways from their discussion. This should flow organically from the conversation, reiterating the key points in a casual, conversational manner. Avoid making it sound like an obvious recap - the goal is to reinforce the central ideas one last time before signing off.
+
+        The podcast should last at least 20 minutes, avoid filling gaps with gibbershish info. Instead you should treat in detail every aspect of the document and make sure the listener grasps the core ideas by making analogies, understanding the problem first and laying out a plan to make sure the audience understands every bit of information. The podcast introduction is about the two speakers presenting themselves and then outlining what the podcast is going to be about as a sort of table of contents/overview.
         </podcast_dialogue>
         """
 
@@ -112,36 +109,32 @@ def generate_audio(file: str, openai_api_key: str = None) -> bytes:
     audio = b""
     transcript = ""
 
-    characters = 0
+    voices = {"guest": guest_voice, "presenter": presenter_voice}
 
     with cf.ThreadPoolExecutor() as executor:
         futures = []
         for line in llm_output.dialogue:
             transcript_line = f"{line.speaker}: {line.text}"
-            future = executor.submit(get_mp3, line.text, line.voice, openai_api_key)
+            future = executor.submit(
+                get_mp3, line.text, tts_version, voices[line.speaker], openai_api_key
+            )
             futures.append((future, transcript_line))
-            characters += len(line.text)
 
         for future, transcript_line in futures:
             audio_chunk = future.result()
             audio += audio_chunk
             transcript += transcript_line + "\n\n"
 
-    logger.info(f"Generated {characters} characters of audio")
+    logger.info(f"Generated {len(transcript)} characters of audio")
 
     temporary_directory = "./gradio_cached_examples/tmp/"
     os.makedirs(temporary_directory, exist_ok=True)
-
-    # we use a temporary file because Gradio's audio component doesn't work with raw bytes in Safari
     temporary_file = NamedTemporaryFile(
-        dir=temporary_directory,
-        delete=False,
-        suffix=".mp3",
+        dir=temporary_directory, delete=False, suffix=".mp3"
     )
     temporary_file.write(audio)
     temporary_file.close()
 
-    # Delete any files in the temp directory that end with .mp3 and are over a day old
     for file in glob.glob(f"{temporary_directory}*.mp3"):
         if os.path.isfile(file) and time.time() - os.path.getmtime(file) > 24 * 60 * 60:
             os.remove(file)
@@ -155,13 +148,24 @@ demo = gr.Interface(
     fn=generate_audio,
     examples=[[str(p)] for p in Path("examples").glob("*.pdf")],
     inputs=[
-        gr.File(
-            label="PDF",
+        gr.File(label="PDF"),
+        gr.Dropdown(
+            choices=["gpt-4o-mini", "gpt-4o", "o1-mini", "o1-preview"],
+            label="Transcription Model",
+            value="gpt-4o-mini",
         ),
-        gr.Textbox(
-            label="OpenAI API Key",
-            visible=not os.getenv("OPENAI_API_KEY"),
+        gr.Dropdown(choices=["tts-1", "tts-1-hd"], label="TTS Version", value="tts-1"),
+        gr.Dropdown(
+            choices=["alloy", "onyx", "fable", "echo", "nova", "shimmer"],
+            label="Guest",
+            value="alloy",
         ),
+        gr.Dropdown(
+            choices=["alloy", "onyx", "fable", "echo", "nova", "shimmer"],
+            label="Presenter",
+            value="nova",
+        ),
+        gr.Textbox(label="OpenAI API Key", visible=not os.getenv("OPENAI_API_KEY")),
     ],
     outputs=[
         gr.Audio(label="Audio", format="mp3"),
@@ -174,12 +178,7 @@ demo = gr.Interface(
     api_name=False,
 )
 
-
-demo = demo.queue(
-    max_size=20,
-    default_concurrency_limit=20,
-)
-
+demo = demo.queue(max_size=20, default_concurrency_limit=20)
 app = gr.mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
